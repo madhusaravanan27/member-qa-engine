@@ -11,7 +11,6 @@ from fastembed import TextEmbedding
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-
 # -------------------
 # Logging & config
 # -------------------
@@ -46,9 +45,7 @@ _msg_vecs: Optional[np.ndarray] = None  # [N, D] normalized embeddings
 # Raw messages (fetched at startup, reused by /ask)
 _raw_msgs: List[Dict] = []
 
-
 app = FastAPI(title=APP_NAME)
-
 
 # -------------------
 # Input / Output Models
@@ -386,8 +383,9 @@ async def ask(req: AskRequest) -> AskResponse:
             )
         except Exception as e:
             logger.exception("Unexpected error fetching messages: %s", e)
+            # Slightly more detailed error to help debugging if upstream is weird
             return AskResponse(
-                answer="Unexpected error fetching messages. Please try again."
+                answer=f"Unexpected error fetching messages: {type(e).__name__}: {e!r}"
             )
 
     # Intent 1: Trip timing to a city
