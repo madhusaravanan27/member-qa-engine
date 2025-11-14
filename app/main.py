@@ -12,20 +12,23 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
+# -------------------
 # Logging & config
-
+# -------------------
 logger = logging.getLogger("member-qa")
 logging.basicConfig(level=logging.INFO)
 
 APP_NAME = "member-qa"
 
+# IMPORTANT: default to the exact host they gave (HTTPS, no extra path)
 MESSAGES_API_BASE = os.getenv(
     "MESSAGES_API_BASE",
-    "http://november7-730026606190.europe-west1.run.app",
+    "https://november7-730026606190.europe-west1.run.app",
 )
-TIMEOUT = float(os.getenv("MESSAGES_API_TIMEOUT", "25"))   
-PAGE_LIMIT = int(os.getenv("MESSAGES_API_LIMIT", "50"))    
-MAX_PAGES = int(os.getenv("MESSAGES_API_MAX_PAGES", "20"))  
+
+TIMEOUT = float(os.getenv("MESSAGES_API_TIMEOUT", "25"))
+PAGE_LIMIT = int(os.getenv("MESSAGES_API_LIMIT", "50"))
+MAX_PAGES = int(os.getenv("MESSAGES_API_MAX_PAGES", "20"))
 
 HEADERS = {
     "Accept": "application/json",
@@ -36,31 +39,47 @@ HEADERS = {
 EMBED_K = int(os.getenv("EMBED_TOPK", "8"))
 
 _embedder: Optional[TextEmbedding] = None
-_msg_texts: List[str] = []          
-_msg_meta: List[Dict] = []          
-_msg_vecs: Optional[np.ndarray] = None  
+_msg_texts: List[str] = []          # indexed message texts
+_msg_meta: List[Dict] = []          # {id, user_name, timestamp}
+_msg_vecs: Optional[np.ndarray] = None  # [N, D] normalized embeddings
 
-
+# Simple cache of raw messages
 _cache = {"t": 0.0, "data": []}
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "120"))
 
 app = FastAPI(title=APP_NAME)
 
 
-# Input / Output Models:
-
+# -------------------
+# Input / Output Models
+# -------------------
 class AskRequest(BaseModel):
     question: str
+
 
 class AskResponse(BaseModel):
     answer: str
 
 
+# -------------------
 # Upstream client
-
+# -------------------
 async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
+    """
+    Fetch one page from the upstream /messages endpoint.
+
+    We are defensive about MESSAGES_API_BASE:
+    - If it already ends with /messages or /messages/, we don't append again.
+    - Otherwise, we append /messages.
+    """
     base = MESSAGES_API_BASE.rstrip("/")
-    url = f"{base}/messages/"
+    if base.endswith("/messages"):
+        # e.g. base = https://.../messages
+        url = base
+    else:
+        # e.g. base = https://... -> https://.../messages
+        url = f"{base}/messages"
+
     async with httpx.AsyncClient(
         timeout=TIMEOUT,
         follow_redirects=True,
@@ -78,6 +97,7 @@ async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
             )
         r.raise_for_status()
         return r.json()
+
 
 async def fetch_all_messages(max_pages: int = MAX_PAGES) -> List[Dict]:
     items: List[Dict] = []
@@ -100,8 +120,9 @@ async def fetch_all_messages(max_pages: int = MAX_PAGES) -> List[Dict]:
     return items
 
 
+# -------------------
 # Intent detection (regex)
-
+# -------------------
 TRIP_Q_RE = re.compile(
     r"(?i)when\s+is\s+(.+?)\s+planning\s+(?:her|his|their)?\s*trip\s+to\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s*\??\s*$"
 )
@@ -109,8 +130,9 @@ TRIP_Q_RE = re.compile(
 YESNO_TRIP_Q_RE = re.compile(
     r"(?i)is\s+(.+?)\s+(?:going|traveling|travelling|heading)\s+to\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s*\??\s*$"
 )
+
 CARS_Q_RE = re.compile(r"(?i)how\s+many\s+cars\s+does\s+(.+?)\s+have\??")
-FAV_Q_RE  = re.compile(r"(?i)what\s+are\s+(.+?)['’]s\s+favorite\s+restaurants\??")
+FAV_Q_RE = re.compile(r"(?i)what\s+are\s+(.+?)['’]s\s+favorite\s+restaurants\??")
 
 NAME_NORM = lambda s: re.sub(r"\s+", " ", (s or "").strip().lower())
 DATE_WORDS = r"(?:on|around|in|by|this|next|coming|on the)"
@@ -122,7 +144,7 @@ TRIP_PATTERNS = [
     re.compile(
         r"(?i)\bto\s+(?P<city>[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\b[^\n]*\b(on|around|in|by)\b\s*(?P<when>[A-Za-z0-9 ,./-]+)"
     ),
-    
+    # extra leniency for phrasing like "headed to London next Friday"
     re.compile(
         rf"(?i)\b(?:to|headed to|off to)\s+(?P<city>[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\b.*?\b{DATE_WORDS}\b\s*(?P<when>[A-Za-z0-9 ,./-]+)"
     ),
@@ -141,10 +163,12 @@ FAV_PATTERNS = [
 ]
 
 
+# -------------------
 # Extraction helpers
-
+# -------------------
 def normalize_city(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
 
 def messages_for_user(all_msgs: List[Dict], name_query: str) -> List[str]:
     target = NAME_NORM(name_query)
@@ -155,6 +179,7 @@ def messages_for_user(all_msgs: List[Dict], name_query: str) -> List[str]:
             if msg.strip():
                 out.append(msg)
     return out
+
 
 def extract_trip_when_to_city(texts: List[str], city: str) -> Optional[str]:
     city_norm = normalize_city(city)
@@ -171,6 +196,7 @@ def extract_trip_when_to_city(texts: List[str], city: str) -> Optional[str]:
                 return when
     return None
 
+
 def extract_car_count(texts: List[str]) -> Optional[str]:
     best = None
     for t in texts:
@@ -183,6 +209,7 @@ def extract_car_count(texts: List[str]) -> Optional[str]:
                 except Exception:
                     pass
     return str(best) if best is not None else None
+
 
 def extract_favorite_restaurants(texts: List[str]) -> Optional[str]:
     for t in texts:
@@ -202,8 +229,9 @@ def extract_favorite_restaurants(texts: List[str]) -> Optional[str]:
     return None
 
 
+# -------------------
 # RAG-lite: embeddings index & retrieval
-
+# -------------------
 @app.on_event("startup")
 async def build_index() -> None:
     """
@@ -253,6 +281,7 @@ async def build_index() -> None:
     norms = np.linalg.norm(_msg_vecs, axis=1, keepdims=True) + 1e-12
     _msg_vecs /= norms
 
+
 def retrieve_similar_messages(
     query: str,
     user_hint: Optional[str] = None,
@@ -297,8 +326,9 @@ def retrieve_similar_messages(
     return results
 
 
+# -------------------
 # API Endpoints
-
+# -------------------
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest) -> AskResponse:
     q = (req.question or "").strip()
@@ -334,7 +364,7 @@ async def ask(req: AskRequest) -> AskResponse:
 
     all_msgs: List[Dict] = _cache["data"]
 
-    # Intent 1: Trip timing to a city 
+    # Intent 1: Trip timing to a city
     m = TRIP_Q_RE.search(q)
     if m:
         name = m.group(1).strip().rstrip("?.!,")
@@ -346,7 +376,7 @@ async def ask(req: AskRequest) -> AskResponse:
         when = extract_trip_when_to_city(texts, city)
         return AskResponse(answer=when or f"No trip to {city} found for {name}.")
 
-    
+    # Intent 1b: Yes/No trip ("Is Layla going to London?")
     m = YESNO_TRIP_Q_RE.search(q)
     if m:
         name = m.group(1).strip().rstrip("?.!,")
@@ -399,10 +429,9 @@ async def ask(req: AskRequest) -> AskResponse:
             answer=favs or f"No favorite restaurants found for {name}."
         )
 
-    
+    # -------------------
     # RAG-lite fallback
-    
-    
+    # -------------------
     user_hint = None
     name_match = re.search(r"(?i)\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", q)
     if name_match:
@@ -438,6 +467,7 @@ async def ask(req: AskRequest) -> AskResponse:
     return AskResponse(
         answer="I couldn't understand the question. Ask about trips to a city, car counts, or favorite restaurants."
     )
+
 
 @app.get("/")
 async def root():
