@@ -1,96 +1,83 @@
 from __future__ import annotations
-import os, re, logging
+import os
+import re
+import logging
+from time import time
 from typing import Dict, List, Optional
 
 import httpx
+import numpy as np
+from fastembed import TextEmbedding
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# -------------------
-# Configuration & logging
-# -------------------
+
+# Logging & config
+
 logger = logging.getLogger("member-qa")
 logging.basicConfig(level=logging.INFO)
 
 APP_NAME = "member-qa"
 
-# Env vars (safe defaults for local dev)
-# Use HTTP base you successfully curl’d; code adds /messages/ and follows redirects.
-MESSAGES_API_BASE = os.getenv("MESSAGES_API_BASE", "http://november7-730026606190.europe-west1.run.app")
-TIMEOUT     = float(os.getenv("MESSAGES_API_TIMEOUT", "25"))   # generous while debugging
-PAGE_LIMIT  = int(os.getenv("MESSAGES_API_LIMIT",   "50"))     # smaller pages return faster
-MAX_PAGES   = int(os.getenv("MESSAGES_API_MAX_PAGES","20"))    # cap pages during dev; raise later
+MESSAGES_API_BASE = os.getenv(
+    "MESSAGES_API_BASE",
+    "http://november7-730026606190.europe-west1.run.app",
+)
+TIMEOUT = float(os.getenv("MESSAGES_API_TIMEOUT", "25"))   
+PAGE_LIMIT = int(os.getenv("MESSAGES_API_LIMIT", "50"))    
+MAX_PAGES = int(os.getenv("MESSAGES_API_MAX_PAGES", "20"))  
+
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "member-qa/1.0",
+}
+
+# RAG-lite config
+EMBED_K = int(os.getenv("EMBED_TOPK", "8"))
+
+_embedder: Optional[TextEmbedding] = None
+_msg_texts: List[str] = []          
+_msg_meta: List[Dict] = []          
+_msg_vecs: Optional[np.ndarray] = None  
+
+
+_cache = {"t": 0.0, "data": []}
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "120"))
 
 app = FastAPI(title=APP_NAME)
 
-# -------------------
-# I/O models
-# -------------------
+
+# Input / Output Models:
+
 class AskRequest(BaseModel):
     question: str
 
 class AskResponse(BaseModel):
     answer: str
 
-# -------------------
-# Robust upstream client
-#  - trailing slash
-#  - follow redirects
-#  - try multiple header profiles (some gateways are picky)
-#  - flip scheme http<->https on 400/401
-# -------------------
-def _flip_scheme(base: str) -> str:
-    base = base.rstrip("/")
-    if base.startswith("https://"):
-        return "http://" + base[len("https://"):]
-    if base.startswith("http://"):
-        return "https://" + base[len("http://"):]
-    return "https://" + base  # default to https if none
+
+# Upstream client
 
 async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
-    bases = [MESSAGES_API_BASE.rstrip("/"), _flip_scheme(MESSAGES_API_BASE)]
-    header_sets = [
-        {},  # bare
-        {"Accept": "application/json"},
-        {
-            "Accept": "application/json",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-        },
-    ]
-
-    last_exc: Optional[Exception] = None
-    for base in bases:
-        url = f"{base.rstrip('/')}/messages/"
-        for hdr in header_sets:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=TIMEOUT,
-                    follow_redirects=True,
-                    trust_env=True,   # respect system proxy/VPN env if present
-                    headers=hdr
-                ) as client:
-                    r = await client.get(url, params={"skip": int(skip), "limit": int(limit)})
-                    if r.status_code >= 400:
-                        snippet = r.text[:200]
-                        logger.warning(
-                            "Upstream %s for %s?skip=%s&limit=%s ; hdr=%s ; body=%s",
-                            r.status_code, url, skip, limit, list(hdr.keys()), snippet
-                        )
-                        # On 400/401 try next header profile / scheme; else raise.
-                        if r.status_code in (400, 401):
-                            continue
-                        r.raise_for_status()
-                    return r.json()
-            except Exception as e:
-                last_exc = e
-                logger.warning("Request error to %s with hdr=%s: %s", url, list(hdr.keys()), e)
-
-    if isinstance(last_exc, httpx.HTTPError):
-        raise last_exc
-    raise httpx.RequestError(f"All attempts to fetch {MESSAGES_API_BASE}/messages/ failed", request=None)
+    base = MESSAGES_API_BASE.rstrip("/")
+    url = f"{base}/messages/"
+    async with httpx.AsyncClient(
+        timeout=TIMEOUT,
+        follow_redirects=True,
+        headers=HEADERS,
+    ) as client:
+        r = await client.get(url, params={"skip": int(skip), "limit": int(limit)})
+        if r.status_code >= 400:
+            logger.error(
+                "Upstream error %s for %s?skip=%s&limit=%s ; body=%s",
+                r.status_code,
+                url,
+                skip,
+                limit,
+                r.text[:300],
+            )
+        r.raise_for_status()
+        return r.json()
 
 async def fetch_all_messages(max_pages: int = MAX_PAGES) -> List[Dict]:
     items: List[Dict] = []
@@ -104,15 +91,23 @@ async def fetch_all_messages(max_pages: int = MAX_PAGES) -> List[Dict]:
         if len(batch) < PAGE_LIMIT:
             break
         skip += PAGE_LIMIT
-    logger.info("Fetched %d messages (pages=%d, page_size=%d)", len(items), (skip // PAGE_LIMIT) + 1, PAGE_LIMIT)
+    logger.info(
+        "Fetched %d messages (pages=%d, page_size=%d)",
+        len(items),
+        (skip // PAGE_LIMIT) + 1,
+        PAGE_LIMIT,
+    )
     return items
 
-# -------------------
+
 # Intent detection (regex)
-# -------------------
-# Tightened city capture: capitalized words to end, optional trailing '?'
+
 TRIP_Q_RE = re.compile(
     r"(?i)when\s+is\s+(.+?)\s+planning\s+(?:her|his|their)?\s*trip\s+to\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s*\??\s*$"
+)
+
+YESNO_TRIP_Q_RE = re.compile(
+    r"(?i)is\s+(.+?)\s+(?:going|traveling|travelling|heading)\s+to\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s*\??\s*$"
 )
 CARS_Q_RE = re.compile(r"(?i)how\s+many\s+cars\s+does\s+(.+?)\s+have\??")
 FAV_Q_RE  = re.compile(r"(?i)what\s+are\s+(.+?)['’]s\s+favorite\s+restaurants\??")
@@ -127,7 +122,7 @@ TRIP_PATTERNS = [
     re.compile(
         r"(?i)\bto\s+(?P<city>[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\b[^\n]*\b(on|around|in|by)\b\s*(?P<when>[A-Za-z0-9 ,./-]+)"
     ),
-    # extra leniency for phrasing like "headed to London next Friday"
+    
     re.compile(
         rf"(?i)\b(?:to|headed to|off to)\s+(?P<city>[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\b.*?\b{DATE_WORDS}\b\s*(?P<when>[A-Za-z0-9 ,./-]+)"
     ),
@@ -145,9 +140,9 @@ FAV_PATTERNS = [
     ),
 ]
 
-# -------------------
+
 # Extraction helpers
-# -------------------
+
 def normalize_city(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -155,8 +150,7 @@ def messages_for_user(all_msgs: List[Dict], name_query: str) -> List[str]:
     target = NAME_NORM(name_query)
     out: List[str] = []
     for m in all_msgs:
-        uname = m.get("user_name") or ""
-        if target in NAME_NORM(uname):
+        if target in NAME_NORM(m.get("user_name")):
             msg = m.get("message") or ""
             if msg.strip():
                 out.append(msg)
@@ -207,33 +201,140 @@ def extract_favorite_restaurants(texts: List[str]) -> Optional[str]:
                 return ", ".join(ordered)
     return None
 
-# -------------------
-# API endpoints
-# -------------------
+
+# RAG-lite: embeddings index & retrieval
+
+@app.on_event("startup")
+async def build_index() -> None:
+    """
+    Build an embedding index over all messages once at startup.
+    If it fails, we just skip RAG fallback.
+    """
+    global _embedder, _msg_texts, _msg_meta, _msg_vecs
+
+    try:
+        msgs = await fetch_all_messages()
+    except Exception as e:
+        logger.exception("Failed to build embedding index from upstream messages: %s", e)
+        _embedder = None
+        _msg_vecs = None
+        _msg_texts = []
+        _msg_meta = []
+        return
+
+    texts: List[str] = []
+    meta: List[Dict] = []
+
+    for m in msgs:
+        t = (m.get("message") or "").strip()
+        if not t:
+            continue
+        texts.append(t)
+        meta.append(
+            {
+                "id": m.get("id"),
+                "user_name": m.get("user_name"),
+                "timestamp": m.get("timestamp"),
+            }
+        )
+
+    if not texts:
+        logger.warning("No non-empty messages found to index.")
+        return
+
+    logger.info("Building embedding index over %d messages", len(texts))
+    _embedder = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vecs = list(_embedder.embed(texts))
+    _msg_vecs = np.array(vecs, dtype=np.float32)
+    _msg_texts = texts
+    _msg_meta = meta
+
+    # L2-normalize for cosine similarity
+    norms = np.linalg.norm(_msg_vecs, axis=1, keepdims=True) + 1e-12
+    _msg_vecs /= norms
+
+def retrieve_similar_messages(
+    query: str,
+    user_hint: Optional[str] = None,
+    k: int = EMBED_K,
+) -> List[Dict]:
+    """
+    RAG-lite retrieval: embed the query, find top-k nearest messages by cosine similarity.
+    If user_hint is provided, lightly bias toward that user's messages.
+    """
+    if not query or _msg_vecs is None or _embedder is None:
+        return []
+
+    q_vec = list(_embedder.embed([query]))[0]
+    qv = np.array(q_vec, dtype=np.float32)
+    qv /= (np.linalg.norm(qv) + 1e-12)
+
+    sims = _msg_vecs @ qv  # cosine similarity
+
+    n = len(sims)
+    if n == 0:
+        return []
+
+    k = min(k, n)
+    idx = np.argpartition(-sims, kth=k - 1)[:k]
+    idx = idx[np.argsort(-sims[idx])]
+
+    results: List[Dict] = []
+    for i in idx:
+        m = {
+            **_msg_meta[i],
+            "text": _msg_texts[i],
+            "score": float(sims[i]),
+        }
+        results.append(m)
+
+    if user_hint:
+        hint = NAME_NORM(user_hint)
+        results.sort(
+            key=lambda r: 0 if hint in NAME_NORM(r.get("user_name") or "") else 1
+        )
+
+    return results
+
+
+# API Endpoints
+
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest) -> AskResponse:
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="Question must not be empty")
 
-    # Fetch messages with robust fallbacks; surface upstream issues in the response
-    try:
-        all_msgs = await fetch_all_messages()
-    except httpx.HTTPStatusError as e:
-        body = ""
+    # Use cache to avoid hammering upstream
+    global _cache
+    now = time()
+    if now - _cache["t"] > CACHE_TTL or not _cache["data"]:
         try:
-            body = e.response.text[:300]
-        except Exception:
-            pass
-        code = e.response.status_code if e.response is not None else "unknown"
-        return AskResponse(answer=f"Upstream API error ({code}): {body or 'no details'}")
-    except httpx.RequestError as e:
-        return AskResponse(answer=f"Upstream API request failed (network/timeout): {e}")
-    except Exception as e:
-        logger.exception("Unexpected error fetching messages: %s", e)
-        return AskResponse(answer="Unexpected error fetching messages. Please try again.")
+            _cache["data"] = await fetch_all_messages()
+            _cache["t"] = now
+        except httpx.HTTPStatusError as e:
+            body = ""
+            try:
+                body = e.response.text[:300]
+            except Exception:
+                pass
+            code = e.response.status_code if e.response is not None else "unknown"
+            return AskResponse(
+                answer=f"Upstream API error ({code}): {body or 'no details'}"
+            )
+        except httpx.RequestError as e:
+            return AskResponse(
+                answer=f"Upstream API request failed (network/timeout): {e}"
+            )
+        except Exception as e:
+            logger.exception("Unexpected error fetching messages: %s", e)
+            return AskResponse(
+                answer="Unexpected error fetching messages. Please try again."
+            )
 
-    # Intent 1: Trip timing to a city
+    all_msgs: List[Dict] = _cache["data"]
+
+    # Intent 1: Trip timing to a city 
     m = TRIP_Q_RE.search(q)
     if m:
         name = m.group(1).strip().rstrip("?.!,")
@@ -243,7 +344,38 @@ async def ask(req: AskRequest) -> AskResponse:
         if not texts:
             return AskResponse(answer=f"I couldn't find any messages for {name}.")
         when = extract_trip_when_to_city(texts, city)
-        return AskResponse(answer= when or f"No trip to {city} found for {name}.")
+        return AskResponse(answer=when or f"No trip to {city} found for {name}.")
+
+    
+    m = YESNO_TRIP_Q_RE.search(q)
+    if m:
+        name = m.group(1).strip().rstrip("?.!,")
+        city = m.group(2).strip().rstrip("?.!,")
+        logger.info("Parsed yes/no trip intent → name=%r city=%r", name, city)
+        texts = messages_for_user(all_msgs, name)
+        if not texts:
+            return AskResponse(answer=f"I couldn't find any messages for {name}.")
+
+        when = extract_trip_when_to_city(texts, city)
+        if when:
+            return AskResponse(
+                answer=f"Yes, {name} mentioned a trip to {city} around {when}."
+            )
+
+        city_lower = city.lower()
+        found_city = any(
+            (city_lower in t.lower())
+            and ("trip" in t.lower() or "going" in t.lower())
+            for t in texts
+        )
+        if found_city:
+            return AskResponse(
+                answer=f"{name} mentioned a trip to {city}, but I couldn't infer an exact date."
+            )
+
+        return AskResponse(
+            answer=f"I couldn't find any trip to {city} mentioned by {name}."
+        )
 
     # Intent 2: Car count
     m = CARS_Q_RE.search(q)
@@ -253,7 +385,7 @@ async def ask(req: AskRequest) -> AskResponse:
         if not texts:
             return AskResponse(answer=f"I couldn't find any messages for {name}.")
         count = extract_car_count(texts)
-        return AskResponse(answer= count or f"I couldn't infer car ownership for {name}.")
+        return AskResponse(answer=count or f"I couldn't infer car ownership for {name}.")
 
     # Intent 3: Favorite restaurants
     m = FAV_Q_RE.search(q)
@@ -263,10 +395,49 @@ async def ask(req: AskRequest) -> AskResponse:
         if not texts:
             return AskResponse(answer=f"I couldn't find any messages for {name}.")
         favs = extract_favorite_restaurants(texts)
-        return AskResponse(answer= favs or f"No favorite restaurants found for {name}.")
+        return AskResponse(
+            answer=favs or f"No favorite restaurants found for {name}."
+        )
 
-    # Fallback
-    return AskResponse(answer="I couldn't understand the question. Ask about trips to a city, car counts, or favorite restaurants.")
+    
+    # RAG-lite fallback
+    
+    
+    user_hint = None
+    name_match = re.search(r"(?i)\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", q)
+    if name_match:
+        user_hint = name_match.group(1)
+
+    candidates = retrieve_similar_messages(q, user_hint=user_hint, k=EMBED_K)
+    texts = [c["text"] for c in candidates]
+
+    if texts:
+        # Trip: infer city from question if present
+        city_match = re.search(
+            r"(?i)\bto\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\b", q
+        )
+        city_guess = city_match.group(1) if city_match else None
+        if city_guess:
+            when = extract_trip_when_to_city(texts, city_guess)
+            if when:
+                return AskResponse(answer=when)
+
+        count = extract_car_count(texts)
+        if count:
+            return AskResponse(answer=count)
+
+        favs = extract_favorite_restaurants(texts)
+        if favs:
+            return AskResponse(answer=favs)
+
+        # If nothing parsed but we have candidates, return a snippet
+        snippet = texts[0]
+        return AskResponse(answer=snippet[:220])
+
+    # Final fallback
+    return AskResponse(
+        answer="I couldn't understand the question. Ask about trips to a city, car counts, or favorite restaurants."
+    )
 
 @app.get("/")
 async def root():
