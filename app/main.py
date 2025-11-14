@@ -18,17 +18,36 @@ logging.basicConfig(level=logging.INFO)
 
 APP_NAME = "member-qa"
 
-# IMPORTANT: default to the exact host they gave (HTTPS, no extra path)
-# Also strip / clean any stray whitespace / newlines
-MESSAGES_API_BASE = (
-    os.getenv(
-        "MESSAGES_API_BASE",
-        "https://november7-730026606190.europe-west1.run.app",
-    )
-    .strip()
-    .replace("\n", "")
-    .replace("\r", "")
+
+def _clean_base_url(raw: str) -> str:
+    """
+    Strip whitespace AND remove any control characters (like '\n', '\r', '\t')
+    from the base URL. If it ends up empty, fall back to default.
+    """
+    default = "https://november7-730026606190.europe-west1.run.app"
+    if raw is None:
+        return default
+
+    # Remove all ASCII control chars 0x00–0x1F and 0x7F
+    cleaned = re.sub(r"[\x00-\x1F\x7F]", "", raw)
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        logger.warning(
+        "MESSAGES_API_BASE is empty after cleaning; falling back to default host."
+        )
+        return default
+
+    return cleaned
+
+
+_raw_base = os.getenv(
+    "MESSAGES_API_BASE",
+    "https://november7-730026606190.europe-west1.run.app",
 )
+
+MESSAGES_API_BASE = _clean_base_url(_raw_base)
+logger.info("Using MESSAGES_API_BASE: %r", MESSAGES_API_BASE)
 
 TIMEOUT = float(os.getenv("MESSAGES_API_TIMEOUT", "25"))
 PAGE_LIMIT = int(os.getenv("MESSAGES_API_LIMIT", "50"))
@@ -72,12 +91,13 @@ async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
     Fetch one page from the upstream /messages endpoint.
 
     We are defensive about MESSAGES_API_BASE:
-    - Strip whitespace / newlines.
+    - Strip whitespace / control chars.
     - If it already ends with /messages or /messages/, we don't append again.
     - Otherwise, we append /messages.
     """
     raw_base = MESSAGES_API_BASE or ""
-    cleaned_base = raw_base.strip().replace("\n", "").replace("\r", "")
+    # extra safety – remove any control chars that somehow survived
+    cleaned_base = re.sub(r"[\x00-\x1F\x7F]", "", raw_base).strip()
 
     if not cleaned_base:
         raise RuntimeError("MESSAGES_API_BASE is empty or invalid after cleaning")
@@ -88,6 +108,9 @@ async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
     else:
         url = f"{base}/messages"
 
+    # one more guard at the final URL level
+    url = re.sub(r"[\x00-\x1F\x7F]", "", url)
+
     logger.info("Using upstream messages URL: %r", url)
 
     async with httpx.AsyncClient(
@@ -95,7 +118,12 @@ async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
         follow_redirects=True,
         headers=HEADERS,
     ) as client:
-        r = await client.get(url, params={"skip": int(skip), "limit": int(limit)})
+        try:
+            r = await client.get(url, params={"skip": int(skip), "limit": int(limit)})
+        except httpx.InvalidURL as e:
+            logger.error("Invalid URL used for upstream request: %r (%s)", url, e)
+            raise
+
         if r.status_code >= 400:
             logger.error(
                 "Upstream error %s for %s?skip=%s&limit=%s ; body=%s",
