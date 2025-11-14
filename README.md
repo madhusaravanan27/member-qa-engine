@@ -1,93 +1,69 @@
-# Bonus 1 — Design Notes
+# Member QA – Design Notes
 
-This project required answering natural-language questions about member messages.  
-Below are the alternative approaches I evaluated while designing the solution.
+This project required building a question-answering system over a collection of member messages. Before choosing the final design, several different solution approaches were considered. This document explains those options and why the final architecture uses a hybrid approach.
 
----
+## 1. Pure Rule-Based Extraction
 
-## 1. Pure Rule-Based Extraction (Regex + Pattern Matching)
-**Idea:** Hand-write intent patterns such as:
-- “When is X planning a trip to Y?”
-- “How many cars does X have?”
-- “What are X's favorite restaurants?”
+The first idea was to answer everything with regex patterns: detecting trip-related questions, extracting locations and dates, counting cars, or identifying restaurant names.
 
-**Pros**
-- Very fast and deterministic.
-- No additional infrastructure (vector search, models, etc.).
-- Easy to debug.
+Advantages:
+- Very fast  
+- Easy to debug  
+- Fully deterministic  
 
-**Cons**
-- Fragile to rephrasing (“headed to Paris” vs “travelling to Paris”).
-- Cannot generalize to questions outside the 3 predefined domains.
-- High maintenance cost as patterns grow.
+Limitations:
+- Breaks easily when the user asks the same question in a different way  
+- Hard to scale to more question types  
+- Not flexible enough for open-ended queries  
 
-**Why it wasn’t enough:**  
-It only works for narrow intents and fails for open-ended or paraphrased questions.
+Because language varies a lot, this approach was not sufficient on its own.
 
----
+## 2. Full RAG Using an LLM
 
-## 2. Full RAG System (LLM + Vector Store)
-**Idea:** Use embeddings + a vector DB (FAISS, Pinecone, Chroma) + an LLM for final answer generation.
+A more powerful approach would be a full retrieval-augmented generation pipeline: embed messages, retrieve the most relevant ones, and let an LLM generate an answer.
 
-**Pros**
-- Most flexible: can answer arbitrary questions.
-- Produces natural, human-readable answers.
-- Handles paraphrasing, synonyms, multi-hop reasoning.
+Advantages:
+- Handles natural language extremely well  
+- Flexible enough for almost any question  
 
-**Cons**
-- Requires GPU/LLM inference → not allowed in this assignment.
-- More expensive infra.
-- Risk of hallucinations unless carefully constrained.
+Limitations:
+- Not allowed for this assignment  
+- Requires more infrastructure  
+- Adds unnecessary complexity  
 
-**Why it wasn’t used:**  
-The assignment explicitly restricts using LLMs for generation, and infrastructure complexity is unnecessary.
+This option was rejected due to project constraints.
 
----
+## 3. Hybrid “RAG-Lite” (Final Choice)
 
-## 3. Hybrid “RAG-Lite” Retrieval + Rule-Based Answering (Chosen Approach)
-**Idea:**  
-- Use `fastembed` to embed all messages.  
-- Retrieve top-K relevant snippets with cosine similarity.  
-- Apply deterministic extraction logic on retrieved text.  
-- If no intent matches, return retrieved snippets directly.
+The final solution combines two ideas:
 
-**Pros**
-- Much more robust than pure regex.
-- Handles paraphrasing (“headed to London” matches “trip to London next Friday”).
-- Still deterministic and cheap to run.
-- No LLM generation (compliant with the assignment).
+- Rule-based logic for well-defined tasks (trip timing, car count, restaurants)  
+- Embedding-based retrieval for open-ended questions  
 
-**Cons**
-- Retrieval quality depends on message density and user activity.
-- Still limited to the 3 supported domains for structured answers.
-- Cannot synthesize new statements.
+This means the system gives exact answers when possible, and falls back to semantic search when the question does not match any rule.
 
-**Why it was chosen:**  
-This approach balances accuracy, generality, and system constraints while remaining simple to deploy.
+Advantages:
+- More flexible and robust than regex alone  
+- Simple to run and deploy  
+- No generative models required  
+- Works even when the question is phrased differently  
 
----
+This balance of precision and flexibility made it the best fit for the assignment.
 
-## 4. (Rejected) Finite-State / Slot-Filling NLU Model
-**Idea:** Train a small intent classifier + slot extractor locally.
+## 4. Custom Intent Classifier
 
-**Pros**
-- More flexible than regex.
-- Small models could run CPU-only.
+A small ML classifier could have been trained to detect question types.
 
-**Cons**
-- Requires labeled training data (not provided).
-- Harder to tune without real user variations.
+Advantages:
+- More generalizable than regex  
+- Simple models would work  
 
-**Why excluded:**  
-Labeling and training overhead is out of scope for a short assignment.
+Limitations:
+- Requires labeled data  
+- Still needs extraction logic afterwards  
 
----
+This option was not selected because labeled training data was not available.
 
-## Final Choice Summary
-I implemented a **hybrid system**:
+## 5. Summary of the Decision
 
-- **Rule-based** extraction for high-precision answers  
-- **Vector-based retrieval** to support paraphrased or generic questions  
-- **No LLMs**, ensuring deterministic behavior and easy deployment (Render)
-
-This gives the best mix of reliability and generalization within the project constraints.
+After comparing all approaches, the hybrid solution was chosen because it provides reliable answers for structured queries and still handles broader, more natural questions through semantic retrieval. It meets all project constraints while remaining simple to deploy and maintain.
