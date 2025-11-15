@@ -158,11 +158,14 @@ A general semantic-search endpoint that retrieves top relevant messages for any 
 - Use `/ask_generic` for broad or exploratory questions  
 
 ## Outputs:
+## ask/ endpoint:
 <img width="878" height="278" alt="image" src="https://github.com/user-attachments/assets/ba847d57-a81c-4e70-8bdb-6f703a07fb97" />
 
 <img width="873" height="217" alt="image" src="https://github.com/user-attachments/assets/fe7ab9dc-db5a-430c-b7c4-738ec7d5381e" />
 
 <img width="883" height="229" alt="image" src="https://github.com/user-attachments/assets/13b9ee71-ffb3-4636-8136-ae58d4c34836" />
+
+## ask/generic endpoint:
 
 <img width="857" height="237" alt="image" src="https://github.com/user-attachments/assets/27a052b7-f25b-4bf6-875f-f9296fd26e77" />
 
