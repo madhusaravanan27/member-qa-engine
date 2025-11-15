@@ -10,9 +10,8 @@ from fastembed import TextEmbedding
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# -------------------
 # Logging & config
-# -------------------
+
 logger = logging.getLogger("member-qa")
 logging.basicConfig(level=logging.INFO)
 
@@ -61,20 +60,20 @@ HEADERS = {
 # RAG-lite config
 EMBED_K = int(os.getenv("EMBED_TOPK", "8"))
 
-_embedder: Optional[TextEmbedding] = None
-_msg_texts: List[str] = []          # indexed message texts
-_msg_meta: List[Dict] = []          # {id, user_name, timestamp}
-_msg_vecs: Optional[np.ndarray] = None  # [N, D] normalized embeddings
+embedder: Optional[TextEmbedding] = None
+msg_texts: List[str] = []          # indexed message texts
+msg_meta: List[Dict] = []          # {id, user_name, timestamp}
+msg_vecs: Optional[np.ndarray] = None  # [N, D] normalized embeddings
 
-# Raw messages (fetched at startup, reused by /ask)
-_raw_msgs: List[Dict] = []
+
+raw_msgs: List[Dict] = []
 
 app = FastAPI(title=APP_NAME)
 
 
-# -------------------
+
 # Input / Output Models
-# -------------------
+
 class AskRequest(BaseModel):
     question: str
 
@@ -83,9 +82,9 @@ class AskResponse(BaseModel):
     answer: str
 
 
-# -------------------
+
 # Upstream client
-# -------------------
+
 async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
     """
     Fetch one page from the upstream /messages endpoint.
@@ -96,7 +95,7 @@ async def fetch_messages_page(skip: int = 0, limit: int = PAGE_LIMIT) -> Dict:
     - Otherwise, we append /messages.
     """
     raw_base = MESSAGES_API_BASE or ""
-    # extra safety – remove any control chars that somehow survived
+    # remove any control chars that somehow survived
     cleaned_base = re.sub(r"[\x00-\x1F\x7F]", "", raw_base).strip()
 
     if not cleaned_base:
@@ -178,9 +177,8 @@ async def fetch_all_messages(max_pages: int = MAX_PAGES) -> List[Dict]:
     return items
 
 
-# -------------------
 # Intent detection (regex)
-# -------------------
+
 TRIP_Q_RE = re.compile(
     r"(?i)when\s+is\s+(.+?)\s+planning\s+(?:her|his|their)?\s*trip\s+to\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s*\??\s*$"
 )
@@ -242,9 +240,9 @@ QUESTION_CAP_STOPWORDS = {
 }
 
 
-# -------------------
+
 # Extraction helpers
-# -------------------
+
 def normalize_city(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -365,9 +363,9 @@ def extract_name_from_question(q: str) -> Optional[str]:
     return None
 
 
-# -------------------
+
 # RAG-lite: embeddings index & retrieval
-# -------------------
+
 @app.on_event("startup")
 async def build_index() -> None:
     """
@@ -464,9 +462,9 @@ def retrieve_similar_messages(
     return results
 
 
-# -------------------
+
 # API Endpoints
-# -------------------
+
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest) -> AskResponse:
     q = (req.question or "").strip()
@@ -502,7 +500,7 @@ async def ask(req: AskRequest) -> AskResponse:
 
     q_lower = q.lower()
 
-    # ---------- Trip summary intent ----------
+    # Trip summary intent 
     m = TRIP_SUMMARY_Q_RE.search(q)
     if m:
         name = m.group(1).strip().rstrip("?.!,")
@@ -534,7 +532,7 @@ async def ask(req: AskRequest) -> AskResponse:
             answer=f"Here are some details mentioned about {name}'s trip: {joined}"
         )
 
-    # ---------- Generic "favorite things" ----------
+    # Generic favorite things
     if "favorite" in q_lower and "restaurant" not in q_lower:
         name = extract_name_from_question(q)
         if name:
@@ -557,7 +555,7 @@ async def ask(req: AskRequest) -> AskResponse:
                         answer=f"I couldn't infer specific favorite things for {name} from the messages."
                     )
 
-    # ---------- Looser restaurant intent ----------
+    # Looser restaurant intent 
     if "restaurant" in q_lower or "restaurants" in q_lower:
         name = extract_name_from_question(q)
         if name:
@@ -646,7 +644,7 @@ async def ask(req: AskRequest) -> AskResponse:
         count = extract_car_count(texts)
         return AskResponse(answer=count or f"I couldn't infer car ownership for {name}.")
 
-    # Intent 3: Favorite restaurants (strict phrasing)
+    # Intent 3: Favorite restaurants 
     m = FAV_Q_RE.search(q)
     if m:
         name = m.group(1).strip().rstrip("?.!,")
@@ -658,9 +656,9 @@ async def ask(req: AskRequest) -> AskResponse:
             answer=favs or f"No favorite restaurants found for {name}."
         )
 
-    # -------------------
+    
     # RAG-lite fallback (for these 3 domains only)
-    # -------------------
+    
     user_hint = extract_name_from_question(q)
     candidates = retrieve_similar_messages(q, user_hint=user_hint, k=EMBED_K)
     texts = [c["text"] for c in candidates]
